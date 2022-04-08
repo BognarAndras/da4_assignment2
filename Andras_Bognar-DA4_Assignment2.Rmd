@@ -1,0 +1,655 @@
+---
+title: 'DA4 - Assignment 2: CO2 emission and GDP'
+author: "A. BOGNAR"
+date: "4/8/2022"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(stringr)
+library(kableExtra)
+library(fixest)
+library(estimatr)
+library(huxtable)
+library(data.table)
+```
+```{r setup II, include=FALSE, eval=TRUE, out.width="65%"}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+A technical note: the code and data can also be found in [this Github repo](https://github.com/BognarAndras/da4_assignment2).
+
+
+## 1. Data
+
+
+```{r data load, echo=FALSE}
+# Load data
+
+github_url <- paste0("https://raw.githubusercontent.com/" ,
+                     "BognarAndras/da4_assignment2/main/world_bank_indicators.csv")
+
+wb_data <- read_csv(github_url)
+
+```
+
+
+```{r data clean,echo=FALSE}
+
+# Clean up World Bank indicator names 
+
+no_space_names <- trimws(gsub(" "  , "" , names(wb_data) ))
+lowered_names <-tolower(no_space_names)
+country_names <- lowered_names[1:2]
+indicator_cols <- lowered_names[-c(1:2)]
+
+# Use regular expressions to remove unnecessary text from names
+
+year_of_col <- str_extract(indicator_cols , "^.{4}")
+end_remove <-  gsub("^([^\\[]*\\[[^\\[]*)\\[.*$", "\\1", indicator_cols)
+full_name <- sub(".*?-", "", end_remove)
+kt_saved <- gsub("\\(kt)" , "_kt" , full_name)
+metric_removed <- gsub("(.*?)(\\(.*)", "\\1", kt_saved)
+comma_removed <- gsub("," , "_" , metric_removed)
+final_col_names <- c(country_names , paste0(year_of_col , "_" , comma_removed))
+
+# Save to working dataframe
+
+wb_data_clean <- copy(wb_data)
+names(wb_data_clean) <- final_col_names
+
+# World Bank csv file contains at the bottom some unnecessary rows without data, remove
+
+wb_data_clean <- head(wb_data_clean,-5)
+
+# Country code not require, name is enough
+
+wb_data_clean <- wb_data_clean |> select(-countrycode)
+
+# Use standard NA for missing values
+
+wb_data_clean[wb_data_clean==".."] <- NA
+
+
+```
+
+```{r which co2 metric, echo=FALSE}
+# Dealing with missing data
+
+# First decide which metric we will use: either total metric emission divided by population
+# or emission per capita
+
+# Decide by checking which has more missing data
+
+missing_any_ppp <- wb_data_clean |> 
+  select(ends_with("co2emissions") ) |> 
+  filter( if_any(, ~ is.na(.))  )
+
+
+missing_any_kt <- wb_data_clean |> 
+  select(ends_with("kt") | ends_with("population_total")) |> 
+  filter( if_any(, ~ is.na(.))  )
+                                         
+
+num_missing_cols <- tibble(
+                             columns = "metric tons per capita",
+                             number_countries_missing = nrow(missing_any_ppp)
+)
+
+num_missing_cols <- add_row(num_missing_cols,
+                              columns = "metric kt or population",
+                              number_countries_missing = nrow(missing_any_kt)
+)
+
+```
+
+To investigate the relationship and assess possible causal relationship between economic activity and CO2 emission I downloaded different [World Bank Indicators](https://databank.worldbank.org/source/world-development-indicators#) and used different regression-based methods. Below I describe my findings.
+
+The indicators have data for total 217 countries. The specific indicators I considered were:
+
+* **GDP per capita** (constant 2015 US$) for economic activity as causal variable. My data is between 1992 and 2018 and this the most recent indicator available for most countries.
+* For **CO2 emissions** I had two options: either take the full CO2 emissions in kilo tonnes or metric tons per capita and divide it by population. Since the two numbers would be exactly the same, I chose by checking which one has more values in the dataset. As you can see below the difference was only one country, so I chose total emissions.
+
+```{r missing metric table}
+
+kable(format(as.data.frame(num_missing_cols),nsmall = 0),  
+      align=rep('c', 2) ) |> kable_styling(latex_options = "hold_position"
+                                           , font_size = 12 )
+
+# Drop population and total emission, decided to use per capita
+
+wb_data_clean <- wb_data_clean |> 
+                 select(!(ends_with("kt") | ends_with("population_total")))
+
+```
+
+The next decision to make was how to deal with missing values, I took the following approach:
+
+* First, drop all countries where either indicator was missing for all years.
+* Second, drop countries with high number (over 10) of missing values in either variable.
+* For countries with low missing values I decided to impute the next year's value (e.g. Kuwait had no emission data before 1995 so this year's value was added to 1992-94). I also checked the results had I dropped all missing values, the results turn out to be not statistically different, you can see them in the Annex.
+
+The last feature engineering step is to log-transform both indicators, this means that our results can be interpreted in percentages, commonly called as elasticity. This is likely easier to interpret than flat values. 2 countries in the data had 0 emissions recorded. These are likely not really 0 but very small emissions. However, I still decided to drop them as they had several missing values and seem to be too small countries (Montenegro, Lebanon) to generalize based on their results.
+
+```{r missing data, echo=FALSE}
+
+# First, remove countries where all data is missing of either causal or outcome var
+
+all_gdp_miss <- wb_data_clean |> 
+  filter((if_all(ends_with("gdppercapita"), ~ is.na(.))  ))
+
+all_co2_miss <- wb_data_clean |> 
+  filter((if_all(ends_with("co2emissions"), ~ is.na(.))  ))
+
+
+wb_data_clean <- anti_join(wb_data_clean, all_gdp_miss , by = "countryname")
+wb_data_clean <- anti_join(wb_data_clean, all_co2_miss , by = "countryname")
+
+# Second, remove high number of missing rows: at least 10 data point of either variable
+
+num_missing_rows <- tibble(
+  country = wb_data_clean$countryname,
+  missing_columns = rowSums(is.na(wb_data_clean))
+)
+
+high_missing_counties <- as.data.frame(num_missing_rows |> 
+  filter(missing_columns > 9)) |> 
+  select(country)
+
+wb_data_clean <- wb_data_clean |> 
+  filter(!(countryname %in% high_missing_counties$country))
+
+# Third, check if there are any 0 values
+
+wb_data_clean[2:55] <- lapply(wb_data_clean[2:55], function(x) as.numeric(as.character(x)))
+
+# It seems yes, 2 countries with 0 emission values. That could just be very low emission
+# However, these are too unique countries with not enough information to generalize 
+# So drop them.
+
+zero_emission_countries <- wb_data_clean |> 
+  filter((if_any(ends_with("co2emissions"), ~ . == 0 )  )) |> 
+  select(countryname)
+
+wb_data_clean <- wb_data_clean |> 
+  filter(!(countryname %in% zero_emission_countries$countryname))
+
+
+# Finally we have no zero values so we can take log of all variables
+
+wb_data_clean[2:55] <- lapply(wb_data_clean[2:55], function(x) log(x))
+
+
+# For the remaining countries with low missing values we have two options, let's compare their
+# results.
+
+# First, drop them all - nets 161 countries.
+
+any_gdp_miss <- wb_data_clean |> 
+  filter((if_any(ends_with("gdppercapita"), ~ is.na(.))  ))
+
+any_co2_miss <- wb_data_clean |> 
+  filter((if_any(ends_with("co2emissions"), ~ is.na(.))  ))
+
+anything_missing <- left_join(any_gdp_miss , any_co2_miss , by = names(any_gdp_miss), all.x=T)
+
+wb_data_clean_all_drop <- anti_join(wb_data_clean, anything_missing , by = "countryname")
+
+# Second option is to impute, I decided to impute the next year's value where available
+# in one case Eritrea the most recent data was missing here imputed from the most recent
+# before it (eg imputing 2018 emission from 2015 the latest available year).
+
+any_miss_gdp_cols <- anything_missing |>
+  select(c(countryname , ends_with("gdppercapita")))
+
+# impute old data missing 
+
+any_miss_gdp_impute <- any_miss_gdp_cols |>
+  gather(key, value, `1992_gdppercapita`:`2018_gdppercapita`) |>
+  group_by(countryname) |>
+  mutate(value = zoo::na.locf(value, na.rm = FALSE, fromLast = TRUE)) |>
+  spread(key, value)
+
+#impute recent missing
+any_miss_gdp_impute <- any_miss_gdp_impute |>
+  gather(key, value, `1992_gdppercapita`:`2018_gdppercapita`) |>
+  group_by(countryname) |>
+  mutate(value = zoo::na.locf(value, na.rm = FALSE, fromLast = FALSE)) |>
+  spread(key, value)
+
+any_miss_emiss_cols <- anything_missing |>
+  select(c(countryname , ends_with("co2emissions")))
+
+any_miss_emiss_impute <- any_miss_emiss_cols |>
+  gather(key, value, `1992_co2emissions`:`2018_co2emissions`) |>
+  group_by(countryname) |>
+  mutate(value = zoo::na.locf(value, na.rm = FALSE, fromLast = TRUE)) |>
+  spread(key, value)
+
+ 
+imputed_table <- left_join(any_miss_gdp_impute , any_miss_emiss_impute , by = "countryname" )
+imputed_table <- imputed_table[,names(anything_missing)]
+
+wb_data_clean <- rbind(anti_join(wb_data_clean , imputed_table, by = "countryname") ,
+                       imputed_table ) 
+
+# Rearrange table based on country name
+
+wb_data_clean <- wb_data_clean |> arrange(countryname)
+
+# Final cleaning before regressions: format variable names to include log. 
+# The table is in wide format now.
+
+names(wb_data_clean) <- c( "countryname",
+      paste0("year_",
+      substr(names(wb_data_clean |> select(-countryname)), 1, 5) , "log" , 
+      substr(names(wb_data_clean |> select(-countryname)), 5, 
+      length(names(wb_data_clean |> select(-countryname))))))
+```
+
+
+
+## 2. Regressions
+
+After the data cleaning I am left with results for 181 countries. First, I checked the general association between the two variables at the beginning and end of the dataset.
+
+### Cross-sectional OLS 1992 and 2018
+
+In 1992 1% higher GDP was associated with just over 1% higher CO2 emission per capita rate among the 181 countries in the data. In 2018 this association is weaker, only 0.89%  
+
+```{r cross section, echo=FALSE}
+
+# Simple OLS 1992
+
+causal_var_one <- "year_1992_log_gdppercapita" 
+outcome_var_one <- "year_1992_log_co2emissions"
+
+formula1 <- as.formula(paste0(outcome_var_one, " ~ ",causal_var_one))
+cross_section_1992 <- feols( formula1, data=wb_data_clean , 
+               vcov = "hetero")
+
+# Simple OLS 2018
+
+causal_var_two <- "year_2018_log_gdppercapita" 
+outcome_var_two <- "year_2018_log_co2emissions"
+
+formula2 <- as.formula(paste0(outcome_var_two, " ~ ",causal_var_two))
+cross_section_2018 <- feols( formula2, data=wb_data_clean , 
+                             vcov = "hetero")
+
+```
+
+```{r cross section table}
+
+varname_report <- c("(Intercept)" = "Intercept",
+                    "year_1992_log_gdppercapita" 
+                    = "Log GDP per capita 1992",
+                    "year_2018_log_gdppercapita"
+                    = "Log GDP per capita 2018")
+style_noHeaders = style.tex(var.title = "", fixef.title = "", stats.title = " ")
+
+kable( etable( cross_section_1992 , cross_section_2018 ,
+               dict = varname_report,
+               se.below = T,
+               coefstat = 'se',
+               fitstat = c('n','r2'),
+               se.row = F,
+               depvar = F,
+               digits = 3,
+               digits.stats = 3) , 
+       col.names = c('(1)','(2)'),
+       "latex", booktabs = TRUE, 
+       caption = 
+         'Simple Cross Sectional Regression') |>
+  kable_styling(latex_options = "hold_position", font_size = 12 )
+
+```
+
+\newpage 
+
+### First difference with and without lags
+
+Moving onto more sophisticated methods to investigate possible causal link, the first difference models account for within-country and yearly trends.
+The first FD model shows that countries where GDP per capita increased by 1% in the same year a nearly 0.5% emission increase was expected on average. If we include effects over 2 years after the increase, we see that a total of 0.55% increase is expected most of which takes place in the same year as the GDP increase. If we look at even longer after-effect, for 6 years we don't see too much change, it seems that most of the effect takes place within the year of economic growth. In fact, the effects starting from the 2nd year are not statistically different from 0.
+
+```{r first difference cleaning and code, echo=FALSE}
+
+# To easily add lags first format table to long format
+
+long_gdp <- melt(setDT(wb_data_clean), 
+             id.vars = c("countryname", paste0("year_" , 1992:2018 , "_log_co2emissions")),
+             variable.name = "year",
+             value.name = "log_gdppercapita")
+
+long_em <- melt(setDT(wb_data_clean), 
+                id.vars = c("countryname", paste0("year_" , 1992:2018 , "_log_gdppercapita")),
+                variable.name = "year",
+                value.name = "log_co2emissions")
+
+# Extract year from column names
+
+long_em$year <- substr(long_em$year , 6 , 9 )
+long_gdp$year <- substr(long_gdp$year , 6 , 9 )
+
+long_gdp <- long_gdp[,c("countryname" , "year" , "log_gdppercapita")]
+long_em <- long_em[,c("countryname" , "year" , "log_co2emissions")]
+
+wb_data_clean_long <- left_join(long_gdp , long_em , by = c("countryname" , "year"))
+wb_data_clean_long <-  wb_data_clean_long |> arrange(countryname , year)
+
+# Correct column data types
+
+wb_data_clean_long$countryname <- as.factor(wb_data_clean_long$countryname)
+wb_data_clean_long$year <- as.numeric(wb_data_clean_long$year)
+
+# add lag cols
+
+wb_data_clean_long <- wb_data_clean_long %>%
+  group_by(countryname) %>%
+  mutate(
+    d_log_gdppercapita = log_gdppercapita- lag(log_gdppercapita),
+    d_log_co2emissions = log_co2emissions - lag(log_co2emissions),
+    ) %>%
+  ungroup()
+
+
+# wb_data_clean_long %>% mutate(across(where(is.numeric), ~ round(., 3)))
+
+# First Difference Model
+
+fd_model <- lm_robust(d_log_co2emissions ~ d_log_gdppercapita,
+                   data = wb_data_clean_long, 
+                   se_type = "stata", 
+                   clusters = countryname)
+
+# Add 2 lags
+
+
+lags_text <- paste(paste0("lag(d_log_gdppercapita,", c(0:2), ")"), collapse = " + ")
+fd_2_lag_formula <- as.formula(paste0("d_log_co2emissions ~ ", lags_text))
+
+fd_2_lag_model <- lm_robust(fd_2_lag_formula,
+                     data = wb_data_clean_long, 
+                     se_type = "stata", 
+                     clusters = countryname
+)
+
+# Add 6 lags
+
+
+lags_text_6 <- paste(paste0("lag(d_log_gdppercapita,", c(0:6), ")"), collapse = " + ")
+fd_6_lag_formula <- as.formula(paste0("d_log_co2emissions ~ ", lags_text_6))
+
+fd_6_lag_model <- lm_robust(fd_6_lag_formula,
+                            data = wb_data_clean_long, 
+                            se_type = "stata", 
+                            clusters = countryname
+)
+
+
+```
+
+```{r first difference results table }
+
+
+
+
+huxreg(fd_model, fd_2_lag_model, fd_6_lag_model, number_format = c(3,3,3),
+             coefs = c("Intercept"="(Intercept)",
+                       "First Diff of GDP per capita"="d_log_gdppercapita",
+                       "Cont Diff GDP per capita"="lag(d_log_gdppercapita, 0)", 
+                       "1st Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 1)", 
+                       "2nd Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 2)",
+                       "3rd Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 3)", 
+                       "4th Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 4)",
+                       "5th Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 5)",
+                       "6th Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 6)"
+             ),
+             statistics = c(N = "nobs", R2 = "r.squared")
+)
+```
+
+### Fixed Effect and Long Difference
+
+If we don't want to look at year-over-year effects but overall outcomes, we have too look at fixed effect or long difference models. 
+The below fixed effect model shows that in years where a country's gdp per capita is 1% higher than its avg. throughout the 27 year period, a total of 0.537% higher emission was experienced than the country's avg. emission in the same period.
+The long difference model affirms a similar result and found that from 1992 to 2018 a 1% increase in gdp per capita resulted in 0.639% increase in emissions on avg in 2018.
+
+```{r FE and long model code, echo=FALSE}
+
+# FE
+
+fe_model <- lm_robust(log_co2emissions ~ log_gdppercapita + year,
+                   data = wb_data_clean_long, 
+                   se_type = "stata", 
+                   fixed_effect =  ~ countryname ,
+                   clusters = countryname)
+
+# Long Difference
+
+wb_data_clean_ld <- wb_data_clean_long |>  
+  filter((year==1992) | (year==2018) ) |> 
+  group_by(countryname) |> 
+  mutate(
+    d_log_gdppercapita = log_gdppercapita- lag(log_gdppercapita),
+    d_log_co2emissions = log_co2emissions - lag(log_co2emissions),
+  ) |> 
+  ungroup()
+
+longdiff_model <- lm_robust(d_log_co2emissions ~ d_log_gdppercapita,
+                      data = wb_data_clean_ld, 
+                      se_type = "stata", 
+                      clusters = countryname)
+
+```
+
+```{r FE and long results table}
+
+huxreg(fe_model, longdiff_model, number_format = c(3,3),
+       coefs = c("Log GDP per capita"="log_gdppercapita", 
+                 "year"="year", 
+                 "Intercept"="(Intercept)",
+                 "Lag of GDP per capita"="d_log_gdppercapita"
+       ),
+       statistics = c(N = "nobs", R2 = "r.squared")
+)
+
+```
+
+## 3. Summary, limitations
+
+In summary, the models seem to show a positive effect between economic growth and emission. The magnitude seems to be around half percent higher emission for one percent gdp per capita increase in most cases.
+However, its important to note that these models only control for country specific trends and overall time trends.
+They do not control for any changes that affect all countries over the full period. They also don't control for changes in either indicator whose affect can change from year to year.
+For instance, we saw the association decreased somewhat between the beginning and end of the period. This might just be coincidence in the data. But we have seen a trend for some of the most developed countries moving to nuclear power such as France or developing countries such as China becoming green super powers. The energy composition of a country can affect both its economic growth and its emission and this affect can change rapidly. To be more confident in establishing a causal relationship we should control for such variables.
+
+Still, while [some argue](https://www.sciencedirect.com/science/article/abs/pii/0305750X9290038W) that economic growth can be achieved without higher emissions, for now most people would consider that scientific and sociological changes are needed to achieve that so until new evidence is presented we can at least take away from these findings that growth did typically lead to higher emissions in this period of human history. With industrial production still literally fueling the growth of emerging countries such as China it is hard to say if this can change before humanity will have to face dire consequences of growth.
+
+## Annex - Comparing imputation to dropping missing values
+
+Results for the same regression when I dropped all countries with any missing data instead of imputation. The same size is smaller by 20 countries. As you will see most coefficients' confidence intervals overlap with the imputation results. Keep in mind that the countries with missing data are generally really small, so if our question included weights, the difference would be even less.
+
+### Cross-section
+
+```{r annex cleaning and cross section, echo=FALSE}
+
+# Dropping all missing annex
+
+names(wb_data_clean_all_drop) <- c( "countryname",
+                      paste0("year_",
+                      substr(names(wb_data_clean_all_drop |> select(-countryname)), 1, 5),
+                      "log", 
+                      substr(names(wb_data_clean_all_drop |> select(-countryname)), 5, 
+                      length(names(wb_data_clean_all_drop |> select(-countryname))))))
+
+
+# Simple OLS 1992
+
+cross_section_1992_drop <- feols( formula1, data=wb_data_clean_all_drop , 
+                             vcov = "hetero")
+
+# Simple OLS 2018
+
+cross_section_2018_drop <- feols( formula2, data=wb_data_clean_all_drop , 
+                             vcov = "hetero")
+
+```
+```{r annex cross section}
+
+varname_report <- c("(Intercept)" = "Intercept",
+                    "year_1992_log_gdppercapita" 
+                    = "Log GDP per capita 1992",
+                    "year_2018_log_gdppercapita"
+                    = "Log GDP per capita 2018")
+style_noHeaders = style.tex(var.title = "", fixef.title = "", stats.title = " ")
+kable( etable( cross_section_1992_drop , cross_section_2018_drop ,
+               dict = varname_report,
+               se.below = T,
+               coefstat = 'se',
+               fitstat = c('n','r2'),
+               se.row = F,
+               depvar = F,
+               digits = 3,
+               digits.stats = 3) , 
+       col.names = c('(1)','(2)'),
+       "latex", booktabs = TRUE, 
+       caption = 
+         'Simple Cross Sectional Regression with all missing dropped') |>
+  kable_styling(latex_options = "hold_position", font_size = 12 )
+
+```
+
+\newpage 
+
+### First difference and lags
+
+```{r annex fd code, echo=FALSE}
+
+# Long format for lags
+
+
+long_drop_gdp <- melt(setDT(wb_data_clean_all_drop), 
+                 id.vars = c("countryname", paste0("year_" , 1992:2018 , "_log_co2emissions")),
+                 variable.name = "year",
+                 value.name = "log_gdppercapita")
+
+long_drop_em <- melt(setDT(wb_data_clean_all_drop), 
+                id.vars = c("countryname", paste0("year_" , 1992:2018 , "_log_gdppercapita")),
+                variable.name = "year",
+                value.name = "log_co2emissions")
+
+long_drop_em$year <- substr(long_drop_em$year , 6 , 9 )
+long_drop_gdp$year <- substr(long_drop_gdp$year , 6 , 9 )
+
+long_drop_gdp <- long_drop_gdp[,c("countryname" , "year" , "log_gdppercapita")]
+long_drop_em <- long_drop_em[,c("countryname" , "year" , "log_co2emissions")]
+
+wb_data_clean_all_drop <- left_join(long_drop_gdp , long_drop_em , by = c("countryname" , "year"))
+wb_data_clean_all_drop <-  wb_data_clean_all_drop |> arrange(countryname , year)
+
+wb_data_clean_all_drop$countryname <- as.factor(wb_data_clean_all_drop$countryname)
+wb_data_clean_all_drop$year <- as.numeric(wb_data_clean_all_drop$year)
+
+# add lag cols
+
+wb_data_clean_all_drop <- wb_data_clean_all_drop %>%
+  group_by(countryname) %>%
+  mutate(
+    d_log_gdppercapita = log_gdppercapita- lag(log_gdppercapita),
+    d_log_co2emissions = log_co2emissions - lag(log_co2emissions),
+  ) %>%
+  ungroup()
+
+# FD
+
+fd_model_drop <- lm_robust(d_log_co2emissions ~ d_log_gdppercapita,
+                      data = wb_data_clean_all_drop, 
+                      se_type = "stata", 
+                      clusters = countryname)
+
+# 2 lags
+
+
+fd_2_lag_model_drop <- lm_robust(fd_2_lag_formula,
+                            data = wb_data_clean_all_drop, 
+                            se_type = "stata", 
+                            clusters = countryname
+)
+
+# 6 lags
+
+
+fd_6_lag_model_drop <- lm_robust(fd_6_lag_formula,
+                            data = wb_data_clean_all_drop, 
+                            se_type = "stata", 
+                            clusters = countryname
+)
+
+```
+
+```{r annex fd results table}
+
+huxreg(fd_model_drop, fd_2_lag_model_drop, fd_6_lag_model_drop, number_format = c(3,3,3),
+             coefs = c("Intercept"="(Intercept)",
+                       "First Diff of GDP per capita"="d_log_gdppercapita",
+                       "Cont Diff GDP per capita"="lag(d_log_gdppercapita, 0)", 
+                       "1st Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 1)", 
+                       "2nd Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 2)",
+                       "3rd Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 3)", 
+                       "4th Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 4)",
+                       "5th Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 5)",
+                       "6th Lag of Diff GDP per capita"="lag(d_log_gdppercapita, 6)"
+             ),
+             statistics = c(N = "nobs", R2 = "r.squared")
+)
+
+
+```
+
+\newpage 
+
+### FE and Long Diff
+
+```{r annex fe long code, echo=FALSE}
+
+# FE
+
+fe_model_drop <- lm_robust(log_co2emissions ~ log_gdppercapita + year,
+                      data = wb_data_clean_all_drop, 
+                      se_type = "stata", 
+                      fixed_effect =  ~ countryname ,
+                      clusters = countryname)
+
+# Long Difference
+
+wb_data_clean_ld_drop <- wb_data_clean_all_drop |>  
+  filter((year==1992) | (year==2018) ) |> 
+  group_by(countryname) |> 
+  mutate(
+    d_log_gdppercapita = log_gdppercapita- lag(log_gdppercapita),
+    d_log_co2emissions = log_co2emissions - lag(log_co2emissions),
+  ) |> 
+  ungroup()
+
+longdiff_model_drop <- lm_robust(d_log_co2emissions ~ d_log_gdppercapita,
+                            data = wb_data_clean_ld_drop, 
+                            se_type = "stata", 
+                            clusters = countryname)
+
+```
+
+```{r annex fe long diff results table}
+huxreg(fe_model_drop, longdiff_model_drop, number_format = c(3,3),
+             coefs = c("Log GDP per capita"="log_gdppercapita", 
+                       "year"="year", 
+                       "Intercept"="(Intercept)",
+                       "Lag of GDP per capita"="d_log_gdppercapita"
+             ),
+             statistics = c(N = "nobs", R2 = "r.squared")
+)
+
+```
+
